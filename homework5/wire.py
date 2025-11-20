@@ -104,7 +104,14 @@ def bad_socket(port: int) -> socket.socket:
 
 def create_server(port: int, loss: float, delay: float, buff_size: int) -> tuple:
 
-    loop = asyncio.get_event_loop()
+    # Python 3.11+ no longer creates a default event loop in the main thread,
+    # so fall back to constructing and installing one if none exists.  This
+    # keeps the homework harness working on newer interpreters (e.g. 3.13+).
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     listen = loop.create_datagram_endpoint(
         lambda: CrummyWireProtocol(loop, loss, delay, buff_size),
         local_addr=('127.0.0.1', port))
