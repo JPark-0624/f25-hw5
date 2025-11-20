@@ -23,6 +23,10 @@ def send(sock: socket.socket, data: bytes):
         data -- A bytes object, containing the data to send over the network.
     """
 
+    # Naive implementation where we chunk the data to be sent into
+    # packets as large as the network will allow, and then send them
+    # over the network, pausing half a second between sends to let the
+    # network "rest" :)
     logger = homework5.logging.get_logger("hw5-sender")
 
     # Packet format:
@@ -49,13 +53,21 @@ def send(sock: socket.socket, data: bytes):
     # RTT estimation variables (TCP-like)
     srtt = None
     rttvar = None
-    min_rto = 0.1
-    max_rto = 2.0
+    # Use a conservative initial timeout to avoid refilling the limited
+    # two-packet channel buffer before the first ACK can return under high
+    # delay (e.g., 1s one-way).
+    initial_rto = 2.5
+    min_rto = 0.5
+    max_rto = 4.0
+    rto_backoff = 1.0
+
+    def base_rto() -> float:
+        if srtt is None:
+            return initial_rto
+        return max(min_rto, min(max_rto, srtt + 4 * rttvar))
 
     def current_rto() -> float:
-        if srtt is None:
-            return 0.5
-        return max(min_rto, min(max_rto, srtt + 4 * rttvar))
+        return min(max_rto, base_rto() * rto_backoff)
 
     window_size = 2  # channel allows only two packets in flight
     base = 0  # earliest unacked byte
@@ -90,6 +102,8 @@ def send(sock: socket.socket, data: bytes):
 
             if pkt_type == ACK:
                 if ack_num > base:
+                    # Successful progress resets backoff
+                    rto_backoff = 1.0
                     # Update RTT using the oldest newly acknowledged packet
                     acked_seqs = [s for s in unacked.keys() if s < ack_num]
                     for s in sorted(acked_seqs):
@@ -109,14 +123,15 @@ def send(sock: socket.socket, data: bytes):
                 base = max(base, seq_num + 1)
                 break
         except socket.timeout:
-            # Retransmit oldest unacked packet
+            # Retransmit oldest unacked packet with exponential backoff
             if unacked:
                 oldest_seq = min(unacked.keys())
                 _, payload = unacked[oldest_seq]
                 pkt = build_packet(DATA, oldest_seq, 0, payload)
                 sock.send(pkt)
                 unacked[oldest_seq] = (time.time(), payload)
-                logger.debug("Timeout -> resend DATA seq=%d", oldest_seq)
+                rto_backoff = min(4.0, rto_backoff * 2)
+                logger.debug("Timeout -> resend DATA seq=%d (backoff=%0.2f)", oldest_seq, rto_backoff)
             continue
 
     # All data acknowledged, initiate teardown
@@ -152,6 +167,7 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
     """
     logger = homework5.logging.get_logger("hw5-receiver")
 
+
     header_struct = struct.Struct("!BIIH")
     header_size = header_struct.size
     DATA, ACK, FIN, FINACK = 0, 1, 2, 3
@@ -163,7 +179,9 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
     buffer: typing.Dict[int, bytes] = {}
     total_written = 0
 
-    sock.settimeout(1.0)
+    # Allow for higher one-way delay; avoid needless wakeups when no data has
+    # been seen yet.
+    sock.settimeout(2.5)
 
     while True:
         try:
@@ -204,9 +222,12 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
                 # Sender may send a last ACK after FINACK; ignore
                 continue
         except socket.timeout:
-            # In case ACKs are lost, retransmit latest ACK
-            ack_pkt = build_packet(ACK, 0, expected_seq)
-            sock.send(ack_pkt)
+            # In case ACKs are lost, retransmit latest ACK only after data has
+            # arrived; sending empty ACKs before the first byte just clogs the
+            # two-packet channel buffer under high delay.
+            if expected_seq > 0:
+                ack_pkt = build_packet(ACK, 0, expected_seq)
+                sock.send(ack_pkt)
             continue
 
     return total_written
