@@ -49,21 +49,13 @@ def send(sock: socket.socket, data: bytes):
     # RTT estimation variables (TCP-like)
     srtt = None
     rttvar = None
-    # Use a conservative initial timeout to avoid refilling the limited
-    # two-packet channel buffer before the first ACK can return under high
-    # delay (e.g., 1s one-way).
-    initial_rto = 2.5
-    min_rto = 0.5
-    max_rto = 4.0
-    rto_backoff = 1.0
-
-    def base_rto() -> float:
-        if srtt is None:
-            return initial_rto
-        return max(min_rto, min(max_rto, srtt + 4 * rttvar))
+    min_rto = 0.1
+    max_rto = 2.0
 
     def current_rto() -> float:
-        return min(max_rto, base_rto() * rto_backoff)
+        if srtt is None:
+            return 0.5
+        return max(min_rto, min(max_rto, srtt + 4 * rttvar))
 
     window_size = 2  # channel allows only two packets in flight
     base = 0  # earliest unacked byte
@@ -98,8 +90,6 @@ def send(sock: socket.socket, data: bytes):
 
             if pkt_type == ACK:
                 if ack_num > base:
-                    # Successful progress resets backoff
-                    rto_backoff = 1.0
                     # Update RTT using the oldest newly acknowledged packet
                     acked_seqs = [s for s in unacked.keys() if s < ack_num]
                     for s in sorted(acked_seqs):
@@ -119,15 +109,14 @@ def send(sock: socket.socket, data: bytes):
                 base = max(base, seq_num + 1)
                 break
         except socket.timeout:
-            # Retransmit oldest unacked packet with exponential backoff
+            # Retransmit oldest unacked packet
             if unacked:
                 oldest_seq = min(unacked.keys())
                 _, payload = unacked[oldest_seq]
                 pkt = build_packet(DATA, oldest_seq, 0, payload)
                 sock.send(pkt)
                 unacked[oldest_seq] = (time.time(), payload)
-                rto_backoff = min(4.0, rto_backoff * 2)
-                logger.debug("Timeout -> resend DATA seq=%d (backoff=%0.2f)", oldest_seq, rto_backoff)
+                logger.debug("Timeout -> resend DATA seq=%d", oldest_seq)
             continue
 
     # All data acknowledged, initiate teardown
