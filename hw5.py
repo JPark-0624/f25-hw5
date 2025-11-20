@@ -23,10 +23,6 @@ def send(sock: socket.socket, data: bytes):
         data -- A bytes object, containing the data to send over the network.
     """
 
-    # Naive implementation where we chunk the data to be sent into
-    # packets as large as the network will allow, and then send them
-    # over the network, pausing half a second between sends to let the
-    # network "rest" :)
     logger = homework5.logging.get_logger("hw5-sender")
 
     # Packet format:
@@ -53,17 +49,13 @@ def send(sock: socket.socket, data: bytes):
     # RTT estimation variables (TCP-like)
     srtt = None
     rttvar = None
-    # Use a conservative initial timeout to avoid refilling the limited
-    # two-packet channel buffer before the first ACK can return under high
-    # delay (e.g., 1s one-way).
-    initial_rto = 2.5
-    min_rto = 0.5
-    max_rto = 4.0
+    min_rto = 0.1   # 매우 공격적인 최소값
+    max_rto = 1.0   # 더 낮은 최대값
     rto_backoff = 1.0
 
     def base_rto() -> float:
         if srtt is None:
-            return initial_rto
+            return 0.5  # 초기값을 0.5초로 줄임
         return max(min_rto, min(max_rto, srtt + 4 * rttvar))
 
     def current_rto() -> float:
@@ -117,10 +109,19 @@ def send(sock: socket.socket, data: bytes):
                             rttvar = (1 - beta) * rttvar + beta * abs(srtt - sample_rtt)
                             srtt = (1 - alpha) * srtt + alpha * sample_rtt
                     base = ack_num
+                elif ack_num == base and unacked:
+                    # Duplicate ACK - 중복 ACK는 패킷 손실 신호
+                    # 가장 오래된 패킷 즉시 재전송
+                    logger.debug("Duplicate ACK %d", ack_num)
+                    oldest_seq = min(unacked.keys())
+                    _, payload = unacked[oldest_seq]
+                    pkt = build_packet(DATA, oldest_seq, 0, payload)
+                    sock.send(pkt)
+                    unacked[oldest_seq] = (time.time(), payload)
             elif pkt_type == FINACK:
                 # Receiver confirmed completion
-                unacked.pop(seq_num, None)
-                base = max(base, seq_num + 1)
+                unacked.clear()
+                base = len(data)
                 break
         except socket.timeout:
             # Retransmit oldest unacked packet with exponential backoff
@@ -130,26 +131,31 @@ def send(sock: socket.socket, data: bytes):
                 pkt = build_packet(DATA, oldest_seq, 0, payload)
                 sock.send(pkt)
                 unacked[oldest_seq] = (time.time(), payload)
-                rto_backoff = min(4.0, rto_backoff * 2)
+                rto_backoff = min(2.0, rto_backoff * 1.25)  # 더 완만한 백오프
                 logger.debug("Timeout -> resend DATA seq=%d (backoff=%0.2f)", oldest_seq, rto_backoff)
             continue
 
     # All data acknowledged, initiate teardown
     fin_seq = len(data)
     fin_packet = build_packet(FIN, fin_seq, 0)
-    while True:
+    fin_attempts = 0
+    max_fin_attempts = 10
+    
+    while fin_attempts < max_fin_attempts:
         try:
             sock.settimeout(current_rto())
             sock.send(fin_packet)
-            logger.debug("Sent FIN seq=%d", fin_seq)
+            logger.debug("Sent FIN seq=%d (attempt %d)", fin_seq, fin_attempts + 1)
             resp = sock.recv(homework5.MAX_PACKET)
             parsed = parse_packet(resp)
             if parsed and parsed[0] == FINACK:
-                # Optionally send a final ACK to be polite
+                # Send a final ACK
                 ack_pkt = build_packet(ACK, 0, parsed[2])
                 sock.send(ack_pkt)
+                logger.debug("Received FINACK, sent final ACK")
                 break
         except socket.timeout:
+            fin_attempts += 1
             continue
 
 
@@ -167,7 +173,6 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
     """
     logger = homework5.logging.get_logger("hw5-receiver")
 
-
     header_struct = struct.Struct("!BIIH")
     header_size = header_struct.size
     DATA, ACK, FIN, FINACK = 0, 1, 2, 3
@@ -178,16 +183,19 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
     expected_seq = 0
     buffer: typing.Dict[int, bytes] = {}
     total_written = 0
+    last_activity = time.time()
+    idle_timeout = 3.0  # 3초로 줄임
 
-    # Allow for higher one-way delay; avoid needless wakeups when no data has
-    # been seen yet.
-    sock.settimeout(2.5)
+    sock.settimeout(0.3)  # 0.3초로 짧게 - ACK 손실 대비
 
     while True:
         try:
             packet = sock.recv(homework5.MAX_PACKET)
             if not packet:
                 continue
+            
+            last_activity = time.time()
+            
             if len(packet) < header_size:
                 continue
             pkt_type, seq_num, ack_num, length = header_struct.unpack(packet[:header_size])
@@ -217,14 +225,26 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
                 finack = build_packet(FINACK, seq_num, expected_seq)
                 sock.send(finack)
                 logger.debug("FIN received, sent FINACK ack=%d", expected_seq)
+                
+                # Wait briefly for final ACK, then exit
+                try:
+                    sock.settimeout(0.2)  # 0.2초로 짧게
+                    final = sock.recv(homework5.MAX_PACKET)
+                    if final:
+                        logger.debug("Received final packet after FINACK")
+                except socket.timeout:
+                    pass
                 break
             elif pkt_type == ACK:
                 # Sender may send a last ACK after FINACK; ignore
                 continue
         except socket.timeout:
-            # In case ACKs are lost, retransmit latest ACK only after data has
-            # arrived; sending empty ACKs before the first byte just clogs the
-            # two-packet channel buffer under high delay.
+            # Check if we've been idle too long
+            if time.time() - last_activity > idle_timeout:
+                logger.debug("Idle timeout - assuming transfer complete")
+                break
+            
+            # In case ACKs are lost, retransmit latest ACK only after data has arrived
             if expected_seq > 0:
                 ack_pkt = build_packet(ACK, 0, expected_seq)
                 sock.send(ack_pkt)
